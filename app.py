@@ -1,18 +1,18 @@
-import streamlit as st
 import re
 import pandas as pd
 from openpyxl.styles import Border, Side, Alignment, Font
 from datetime import datetime
-import io
+import os
 
-# --- HELPER FUNCTIONS ---
 def extract_metadata(text):
+    # Flattens the text to make finding the account details easier
     flat_text = text.replace('\n', '  ')
     meta = {
         "name": "", "address": "", "cust_id": "", "ifsc": "", 
         "acct_num": "", "branch": "", "date_from": "-", "date_to": "-"
     }
     
+    # Scans for the specific labels and captures the data next to them
     name_m = re.search(r'Account holder name:\s*(.*?)\s+(?:Account holder address:|Customer ID:)', flat_text, re.IGNORECASE)
     if name_m: meta["name"] = name_m.group(1).strip()
     
@@ -38,10 +38,16 @@ def extract_metadata(text):
         
     return meta
 
-def build_excel_bytes(full_text):
-    lines = full_text.split('\n')
+def build_excel_from_text(text_path, excel_path):
+    print(f"Reading raw data from {text_path}...")
+    with open(text_path, 'r', encoding='utf-8') as f:
+        full_text = f.read()
+        lines = full_text.split('\n')
+
+    # 1. Grab the Account Details for the Header
     meta = extract_metadata(full_text)
 
+    # 2. Process Transactions
     transactions = []
     current_txn = None
     trigger_pattern = re.compile(r'^(\d+)\s+(\d{2}-\d{2}-\d{4})\s+(.+?)\s+([\d,]+\.\d{2})$')
@@ -74,11 +80,14 @@ def build_excel_bytes(full_text):
     if current_txn and 'Balance' in current_txn: transactions.append(current_txn)
     
     if not transactions:
-        return None
+        print("No transactions found!")
+        return
 
+    # Flip to Chronological Order
     transactions.reverse()
     df = pd.DataFrame(transactions)
 
+    # Math Validation (Debit vs Credit)
     debits, credits = [], []
     for i in range(len(df)):
         amt = df.loc[i, 'Amount']
@@ -98,11 +107,14 @@ def build_excel_bytes(full_text):
     df['Credit'] = credits
     df = df[['Date', 'Remarks', 'Debit', 'Credit', 'Balance']]
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+    # 3. WRITE THE BEAUTIFUL EXCEL FILE
+    print("Applying Professional Formatting...")
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        # Push the table down to row 14 so we have room for the header
         df.to_excel(writer, sheet_name='Statement', index=False, startrow=13)
         worksheet = writer.sheets['Statement']
 
+        # --- TITLE & DATE ---
         worksheet.merge_cells('A1:E2')
         worksheet['A1'] = "Detailed Statement"
         worksheet['A1'].font = Font(size=18, bold=True)
@@ -112,6 +124,7 @@ def build_excel_bytes(full_text):
         worksheet['E3'].font = Font(bold=True)
         worksheet['E3'].alignment = Alignment(horizontal='right')
 
+        # --- THE INFO BOX ---
         worksheet['A4'] = "Account holder name:"
         worksheet['B4'] = meta["name"]
         worksheet['C4'] = "Account holder address:"
@@ -130,6 +143,7 @@ def build_excel_bytes(full_text):
         worksheet.merge_cells('D6:E6')
         worksheet['D6'] = meta["branch"]
         
+        # Apply Box Borders
         box_border = Border(left=Side(style='thin'), right=Side(style='thin'), 
                             top=Side(style='thin'), bottom=Side(style='thin'))
         for r in range(4, 7):
@@ -137,24 +151,29 @@ def build_excel_bytes(full_text):
                 cell = worksheet.cell(row=r, column=c)
                 cell.border = box_border
                 cell.alignment = Alignment(vertical='center', wrap_text=True)
-                if c in [1, 3]: cell.font = Font(size=10)
-                else: cell.font = Font(size=10, bold=True)
+                if c in [1, 3]: cell.font = Font(size=10) # Normal font for labels
+                else: cell.font = Font(size=10, bold=True) # Bold font for your details
 
+        # --- FILTERS ---
         worksheet['A8'] = "Transaction Date"
         worksheet['B8'] = f"from: {meta['date_from']}"
         worksheet['C8'] = f"to: {meta['date_to']}"
+        
         worksheet['A9'] = "Amount"
         worksheet['B9'] = "from: -"
         worksheet['C9'] = "to: -"
+        
         worksheet['A10'] = "Cheque"
         worksheet['B10'] = "from: -"
         worksheet['C10'] = "to: -"
+        
         worksheet['A11'] = "Transaction type: All"
         
         for r in range(8, 12):
             for c in range(1, 4):
                 worksheet.cell(row=r, column=c).font = Font(bold=True, size=10)
 
+        # --- FORMAT TRANSACTION TABLE ---
         headers = ["DATE", "REMARKS", "DEBIT", "CREDIT", "BALANCE"]
         for col_num, header in enumerate(headers, 1):
             cell = worksheet.cell(row=14, column=col_num, value=header)
@@ -168,65 +187,19 @@ def build_excel_bytes(full_text):
                 cell.border = box_border
                 cell.alignment = Alignment(wrap_text=True, vertical='center')
 
+        # Inject Running Balance Formula
         for r in range(16, max_row + 1):
             worksheet[f"E{r}"] = f"=E{r-1}+SUM(D{r})-SUM(C{r})"
 
+        # Adjust Column Widths & Heights to fit everything beautifully
         worksheet.column_dimensions['A'].width = 18
         worksheet.column_dimensions['B'].width = 40
         worksheet.column_dimensions['C'].width = 15
         worksheet.column_dimensions['D'].width = 15
         worksheet.column_dimensions['E'].width = 18
-        worksheet.row_dimensions[4].height = 30 
+        worksheet.row_dimensions[4].height = 30 # Gives extra room for address to wrap
 
-    return output.getvalue()
+    print(f"Success! Final professional statement saved to: {os.path.abspath(excel_path)}")
 
-
-# --- STREAMLIT UI & LOGIN SYSTEM ---
-st.set_page_config(page_title="Statement Converter")
-
-# Initialize session state for authentication
-if 'authenticated' not in st.session_state:
-    st.session_state['authenticated'] = False
-
-if not st.session_state['authenticated']:
-    # Show Login Form
-    st.title("Login Required")
-    
-    user_id = st.text_input("User ID")
-    password = st.text_input("Password", type="password")
-    
-    if st.button("Login"):
-        if user_id == "Harsh" and password == "9806":
-            st.session_state['authenticated'] = True
-            st.rerun()  # Refreshes the page to show the main app
-        else:
-            st.error("Incorrect User ID or Password.")
-
-else:
-    # Show Main App
-    st.title("Bank Statement Text to Excel Converter")
-    
-    # Optional logout button in the sidebar
-    if st.sidebar.button("Logout"):
-        st.session_state['authenticated'] = False
-        st.rerun()
-
-    uploaded_file = st.file_uploader("Upload raw statement text file (.txt)", type=["txt"])
-
-    if uploaded_file is not None:
-        raw_text = uploaded_file.read().decode("utf-8")
-        
-        if st.button("Process Statement"):
-            with st.spinner("Converting..."):
-                excel_data = build_excel_bytes(raw_text)
-                
-                if excel_data:
-                    st.success("Conversion successful!")
-                    st.download_button(
-                        label="Download Final Statement (Excel)",
-                        data=excel_data,
-                        file_name="final_statement.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                else:
-                    st.error("No valid transactions found in the uploaded text.")
+if __name__ == "__main__":
+    build_excel_from_text("raw_data.txt", "final_statement.xlsx")
