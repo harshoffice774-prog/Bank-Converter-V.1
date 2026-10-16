@@ -3,6 +3,7 @@ import pandas as pd
 from openpyxl.styles import Border, Side, Alignment, Font
 from datetime import datetime
 import os
+import pdfplumber
 import streamlit as st
 
 def extract_metadata(text):
@@ -39,11 +40,18 @@ def extract_metadata(text):
         
     return meta
 
-def build_excel_from_text(text_path, excel_path):
-    print(f"Reading raw data from {text_path}...")
-    with open(text_path, 'r', encoding='utf-8') as f:
-        full_text = f.read()
-        lines = full_text.split('\n')
+def build_excel_from_pdf(pdf_path, excel_path):
+    print(f"Reading PDF data from {pdf_path}...")
+    full_text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                full_text += page_text + "\n"
+
+    # Ensure ₹ Balance is always on its own line if the PDF extractor merges it onto the same line
+    full_text = re.sub(r'(?<!^)\s*(₹\s*[\d,]+\.\d{2})', r'\n\1', full_text, flags=re.MULTILINE)
+    lines = full_text.split('\n')
 
     # 1. Grab the Account Details for the Header
     meta = extract_metadata(full_text)
@@ -60,7 +68,8 @@ def build_excel_from_text(text_path, excel_path):
 
         trigger_match = trigger_pattern.match(line)
         if trigger_match:
-            if current_txn and 'Balance' in current_txn: transactions.append(current_txn)
+            if current_txn and current_txn.get('Balance') is not None:
+                transactions.append(current_txn)
             current_txn = {
                 'Date': trigger_match.group(2), 'Remarks': trigger_match.group(3),
                 'Amount': float(trigger_match.group(4).replace(',', '')), 'Balance': None
@@ -78,7 +87,8 @@ def build_excel_from_text(text_path, excel_path):
                 continue
             current_txn['Remarks'] += " " + line
 
-    if current_txn and 'Balance' in current_txn: transactions.append(current_txn)
+    if current_txn and current_txn.get('Balance') is not None:
+        transactions.append(current_txn)
     
     if not transactions:
         print("No transactions found!")
@@ -203,16 +213,15 @@ def build_excel_from_text(text_path, excel_path):
     print(f"Success! Final professional statement saved to: {os.path.abspath(excel_path)}")
 
 
-# --- STREAMLIT ONLINE INTERFACE & LOGIN ---
+# --- STREAMLIT LOGIN & DIRECT PDF TO EXCEL CONVERTER ---
 if __name__ == "__main__":
-    st.set_page_config(page_title="Statement Converter")
+    st.set_page_config(page_title="Bank Statement PDF to Excel")
 
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
 
-    # 1. Login Screen
     if not st.session_state.logged_in:
-        st.title("Login to Statement Converter")
+        st.title("Login to Converter")
         user_id = st.text_input("USER ID")
         password = st.text_input("Password", type="password")
 
@@ -223,32 +232,28 @@ if __name__ == "__main__":
             else:
                 st.error("Invalid USER ID or Password")
 
-    # 2. Main Converter Screen (After Login)
     else:
-        st.title("Bank Statement Converter")
-        
+        st.title("Bank Statement PDF to Excel Converter")
+
         if st.sidebar.button("Logout"):
             st.session_state.logged_in = False
             st.rerun()
 
-        uploaded_file = st.file_uploader("Upload your raw_data.txt file", type=["txt"])
+        uploaded_pdf = st.file_uploader("Upload Bank Statement PDF", type=["pdf"])
 
-        if uploaded_file is not None:
-            if st.button("Convert to Excel"):
-                # Remove old output file if it exists
+        if uploaded_pdf is not None:
+            if st.button("Convert PDF to Excel"):
                 if os.path.exists("final_statement.xlsx"):
                     os.remove("final_statement.xlsx")
 
-                # Save uploaded file as raw_data.txt so your original function can read it
-                with open("raw_data.txt", "wb") as f:
-                    f.write(uploaded_file.getbuffer())
+                # Save the uploaded PDF directly and pass it to build_excel_from_pdf
+                with open("statement.pdf", "wb") as f:
+                    f.write(uploaded_pdf.getbuffer())
 
-                # Run your exact function
-                build_excel_from_text("raw_data.txt", "final_statement.xlsx")
+                build_excel_from_pdf("statement.pdf", "final_statement.xlsx")
 
-                # Check if the Excel file was created and offer download
                 if os.path.exists("final_statement.xlsx"):
-                    st.success("Success! Final professional statement is ready.")
+                    st.success("Success! Excel statement generated.")
                     with open("final_statement.xlsx", "rb") as excel_file:
                         st.download_button(
                             label="Download final_statement.xlsx",
@@ -257,4 +262,4 @@ if __name__ == "__main__":
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
                 else:
-                    st.error("No transactions found!")
+                    st.error("No transactions found in the uploaded PDF!")
