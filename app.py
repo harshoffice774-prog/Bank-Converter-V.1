@@ -3,6 +3,7 @@ import pandas as pd
 from openpyxl.styles import Border, Side, Alignment, Font
 from datetime import datetime
 import os
+import streamlit as st
 
 def extract_metadata(text):
     # Flattens the text to make finding the account details easier
@@ -201,5 +202,59 @@ def build_excel_from_text(text_path, excel_path):
 
     print(f"Success! Final professional statement saved to: {os.path.abspath(excel_path)}")
 
+
+# --- STREAMLIT ONLINE INTERFACE & LOGIN ---
 if __name__ == "__main__":
-    build_excel_from_text("raw_data.txt", "final_statement.xlsx")
+    st.set_page_config(page_title="Statement Converter")
+
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+
+    # 1. Login Screen
+    if not st.session_state.logged_in:
+        st.title("Login to Statement Converter")
+        user_id = st.text_input("USER ID")
+        password = st.text_input("Password", type="password")
+
+        if st.button("Login"):
+            if user_id == "Harsh" and password == "9806":
+                st.session_state.logged_in = True
+                st.rerun()
+            else:
+                st.error("Invalid USER ID or Password")
+
+    # 2. Main Converter Screen (After Login)
+    else:
+        st.title("Bank Statement Converter")
+        
+        if st.sidebar.button("Logout"):
+            st.session_state.logged_in = False
+            st.rerun()
+
+        uploaded_file = st.file_uploader("Upload your raw_data.txt file", type=["txt"])
+
+        if uploaded_file is not None:
+            if st.button("Convert to Excel"):
+                # Remove old output file if it exists
+                if os.path.exists("final_statement.xlsx"):
+                    os.remove("final_statement.xlsx")
+
+                # Save uploaded file as raw_data.txt so your original function can read it
+                with open("raw_data.txt", "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+
+                # Run your exact function
+                build_excel_from_text("raw_data.txt", "final_statement.xlsx")
+
+                # Check if the Excel file was created and offer download
+                if os.path.exists("final_statement.xlsx"):
+                    st.success("Success! Final professional statement is ready.")
+                    with open("final_statement.xlsx", "rb") as excel_file:
+                        st.download_button(
+                            label="Download final_statement.xlsx",
+                            data=excel_file,
+                            file_name="final_statement.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                else:
+                    st.error("No transactions found!")
