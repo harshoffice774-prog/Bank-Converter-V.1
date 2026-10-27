@@ -4,8 +4,15 @@ import re
 import time
 import pandas as pd
 import pdfplumber
+import fitz  # PyMuPDF - renders PDF pages to images (no Poppler needed)
+import pytesseract
+from PIL import Image, ImageOps, ImageFilter
+from pdfminer.pdfdocument import PDFPasswordIncorrect
 from datetime import datetime
 from openpyxl.styles import Border, Side, Alignment, Font
+
+# Windows only: if Tesseract is not in PATH, uncomment and fix this path
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # --- HELPER: TIME FORMATTER ---
 def format_seconds(sec):
@@ -24,6 +31,37 @@ def parse_any_date(date_str):
         except ValueError:
             continue
     return None
+
+# --- OCR HELPERS ---
+def tesseract_available():
+    try:
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+def render_page_image(doc, page_idx, dpi):
+    page = doc[page_idx]
+    zoom = dpi / 72
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    img = ImageOps.grayscale(img)
+    img = ImageOps.autocontrast(img)
+    img = img.filter(ImageFilter.SHARPEN)
+    return img
+
+def clean_ocr_text(text):
+    """Fix common OCR glitches so the amount/date patterns still match."""
+    text = text.replace('|', ' ')
+    text = re.sub(r'(\d)\s+\.(\d{2})\b', r'\1.\2', text)    # "1,234 .56" -> "1,234.56"
+    text = re.sub(r'(\d),\s(\d{3})', r'\1,\2', text)         # "1, 234.00" -> "1,234.00"
+    text = re.sub(r'(\d)\s*,\s*(\d{2})\b(?!\d)', r'\1.\2', text) if False else text
+    text = re.sub(r'[ \t]+', ' ', text)
+    return text
+
+def ocr_page_text(img, lang):
+    raw = pytesseract.image_to_string(img, lang=lang, config="--psm 6")
+    return clean_ocr_text(raw)
 
 # --- UNIVERSAL METADATA EXTRACTOR ---
 def extract_metadata(text):
@@ -59,24 +97,48 @@ def extract_metadata(text):
     return meta
 
 # --- UNIVERSAL MULTI-BANK CONVERSION ENGINE ---
-def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text):
+def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
+                force_ocr=False, ocr_lang="eng", ocr_dpi=300):
     start_time = time.time()
     full_text = ""
+    ocr_pages = 0
+    pdf_bytes = pdf_file.getvalue()
     
     # 1. Open PDF
     try:
-        pdf = pdfplumber.open(pdf_file, password=pdf_password if pdf_password else None)
+        pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=pdf_password if pdf_password else None)
         if len(pdf.pages) > 0:
-            _ = pdf.pages[0].chars # Trigger decryption check
-    except pdfplumber.pdfminer.pdfdocument.PDFPasswordIncorrect:
+            _ = pdf.pages[0].chars  # Trigger decryption check
+    except PDFPasswordIncorrect:
         raise ValueError("Incorrect password or PDF is password-protected. Please enter the correct password.")
     except Exception as e:
+        if "password" in str(e).lower():
+            raise ValueError("Incorrect password or PDF is password-protected. Please enter the correct password.")
         raise ValueError(f"Failed to open PDF: {e}")
 
-    # 2. Extract Text
+    mu_doc = None  # PyMuPDF document, opened only if OCR is needed
+
+    # 2. Extract Text (normal first, OCR fallback per page)
     total_pages = len(pdf.pages)
     for idx, page in enumerate(pdf.pages):
         text = page.extract_text()
+        has_text = bool(text and len(text.strip()) > 30)
+
+        if force_ocr or not has_text:
+            if not tesseract_available():
+                raise ValueError(
+                    "This PDF needs OCR but Tesseract is not installed. "
+                    "Install Tesseract (or add packages.txt on Streamlit Cloud)."
+                )
+            if mu_doc is None:
+                mu_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                if mu_doc.needs_pass:
+                    mu_doc.authenticate(pdf_password or "")
+            status_text.text(f"OCR running: Page {idx + 1} of {total_pages} (scanned page)...")
+            img = render_page_image(mu_doc, idx, ocr_dpi)
+            text = ocr_page_text(img, ocr_lang)
+            ocr_pages += 1
+
         if text:
             full_text += text + "\n"
             
@@ -88,6 +150,8 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text):
         timer_text.text(f"Time Taken: {format_seconds(elapsed)}")
     
     pdf.close()
+    if mu_doc is not None:
+        mu_doc.close()
 
     # 3. Parse Transactions
     status_text.text("Validating transactions & calculating balances (82%)...")
@@ -171,7 +235,10 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text):
         transactions.append(current_txn)
 
     if not transactions:
-        raise ValueError("Could not detect transactions. Ensure it is a text-based bank statement.")
+        if ocr_pages:
+            raise ValueError("OCR ran but no transactions were detected. Try a higher OCR DPI (400), "
+                             "check the OCR language, or use a clearer scan.")
+        raise ValueError("Could not detect transactions in this statement.")
 
     # 4. Chronological Check
     if len(transactions) > 1:
@@ -184,11 +251,14 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text):
 
     # 5. Math Validation
     debits, credits = [], []
+    mismatch_rows = 0
     for i in range(len(df)):
         amt = df.loc[i, 'Amount']
         remarks = df.loc[i, 'Remarks'].upper()
         if i > 0:
             diff = round(df.loc[i, 'Balance'] - df.loc[i-1, 'Balance'], 2)
+            if abs(abs(diff) - amt) > 0.01:
+                mismatch_rows += 1   # possible OCR misread
             if diff > 0:
                 credits.append(amt); debits.append(None)
             elif diff < 0:
@@ -271,15 +341,22 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text):
     progress_bar.progress(100)
     status_text.text(f"✅ Complete! Extracted {len(df)} transactions.")
     output.seek(0)
-    return output
+    return output, len(df), ocr_pages, total_pages, mismatch_rows
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Universal Bank Converter", page_icon="🏦")
 st.title("🏦 Universal Bank Statement Converter")
-st.write("Convert your PDF bank statements directly to a formatted Excel file.")
+st.write("Convert your PDF bank statements (including scanned / unselectable PDFs) directly to a formatted Excel file.")
 
 uploaded_file = st.file_uploader("Upload Bank Statement PDF", type=["pdf"])
 pdf_password = st.text_input("PDF Password (leave blank if none)", type="password")
+
+with st.expander("⚙️ OCR settings (for scanned PDFs)"):
+    force_ocr = st.checkbox("Force OCR on all pages", value=False,
+                            help="Normally OCR runs only on pages that have no selectable text.")
+    ocr_lang = st.text_input("OCR language", value="eng", help="Example: eng+hin for English + Hindi")
+    ocr_dpi = st.select_slider("OCR quality (DPI)", options=[200, 250, 300, 400], value=300,
+                               help="Higher = more accurate but slower.")
 
 if uploaded_file is not None:
     if st.button("Convert to Excel"):
@@ -288,9 +365,17 @@ if uploaded_file is not None:
         timer_text = st.empty()
         
         try:
-            excel_buffer = process_pdf(uploaded_file, pdf_password, progress_bar, status_text, timer_text)
+            excel_buffer, n_txn, ocr_pages, total_pages, mismatch = process_pdf(
+                uploaded_file, pdf_password, progress_bar, status_text, timer_text,
+                force_ocr=force_ocr, ocr_lang=ocr_lang, ocr_dpi=ocr_dpi
+            )
             
             st.success("Conversion successful!")
+            if ocr_pages:
+                st.info(f"OCR was used on {ocr_pages} of {total_pages} pages.")
+            if mismatch:
+                st.warning(f"{mismatch} row(s) have a balance that doesn't match the amount. "
+                           "This is usually an OCR misread, so please check those rows against the PDF.")
             st.download_button(
                 label="📥 Download Excel File",
                 data=excel_buffer,
