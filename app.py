@@ -6,13 +6,14 @@ import pandas as pd
 import pdfplumber
 import fitz  # PyMuPDF - renders PDF pages to images (no Poppler needed)
 import pytesseract
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps
 from pdfminer.pdfdocument import PDFPasswordIncorrect
 from datetime import datetime
 from openpyxl.styles import Border, Side, Alignment, Font
 
 # Windows only: if Tesseract is not in PATH, uncomment and fix this path
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
 
 # --- HELPER: TIME FORMATTER ---
 def format_seconds(sec):
@@ -21,6 +22,7 @@ def format_seconds(sec):
     mins = int(sec // 60)
     rem_sec = sec % 60
     return f"{mins}m {rem_sec:.1f}s"
+
 
 # --- HELPER: UNIVERSAL DATE PARSER ---
 def parse_any_date(date_str):
@@ -32,6 +34,7 @@ def parse_any_date(date_str):
             continue
     return None
 
+
 # --- OCR HELPERS ---
 def tesseract_available():
     try:
@@ -40,61 +43,84 @@ def tesseract_available():
     except Exception:
         return False
 
+
 def render_page_image(doc, page_idx, dpi):
+    """Draws one PDF page as an image in memory, then cleans it for OCR."""
     page = doc[page_idx]
     zoom = dpi / 72
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     img = ImageOps.grayscale(img)
-    img = ImageOps.autocontrast(img)
-    img = img.filter(ImageFilter.SHARPEN)
+    img = ImageOps.autocontrast(img, cutoff=2)
+    img = img.point(lambda p: 255 if p > 170 else 0)
+    img = ImageOps.expand(img, border=20, fill=255)
     return img
+
 
 def clean_ocr_text(text):
     """Fix common OCR glitches so the amount/date patterns still match."""
     text = text.replace('|', ' ')
     text = re.sub(r'(\d)\s+\.(\d{2})\b', r'\1.\2', text)    # "1,234 .56" -> "1,234.56"
     text = re.sub(r'(\d),\s(\d{3})', r'\1,\2', text)         # "1, 234.00" -> "1,234.00"
-    text = re.sub(r'(\d)\s*,\s*(\d{2})\b(?!\d)', r'\1.\2', text) if False else text
     text = re.sub(r'[ \t]+', ' ', text)
     return text
 
+
 def ocr_page_text(img, lang):
-    raw = pytesseract.image_to_string(img, lang=lang, config="--psm 6")
-    return clean_ocr_text(raw)
+    """Tries several page-segmentation modes and falls back to English."""
+    last_err = None
+    langs = [lang] if lang == "eng" else [lang, "eng"]
+
+    for lg in langs:
+        for psm in (6, 4, 3, 11):
+            try:
+                raw = pytesseract.image_to_string(
+                    img, lang=lg, config=f"--oem 3 --psm {psm}"
+                )
+                if raw and len(raw.strip()) > 20:
+                    return clean_ocr_text(raw)
+            except Exception as e:
+                last_err = e
+                continue
+
+    if last_err:
+        raise ValueError(f"OCR failed on this page: {last_err}")
+    return ""
+
 
 # --- UNIVERSAL METADATA EXTRACTOR ---
 def extract_metadata(text):
     flat_text = text.replace('\n', '  ')
     meta = {
-        "name": "-", "address": "-", "cust_id": "-", "ifsc": "-", 
+        "name": "-", "address": "-", "cust_id": "-", "ifsc": "-",
         "acct_num": "-", "branch": "-", "date_from": "-", "date_to": "-"
     }
-    
+
     name_m = re.search(r'(?:Account\s*holder\s*name|Customer\s*Name|Account\s*Name|Name)\s*[:\-]\s*(.*?)\s+(?:Account|Customer|Address|Branch|IFSC|CIF)', flat_text, re.IGNORECASE)
     if name_m: meta["name"] = name_m.group(1).strip()
-    
+
     addr_m = re.search(r'(?:Account\s*holder\s*address|Customer\s*Address|Address)\s*[:\-]\s*(.*?)\s+(?:Customer|IFSC|Account|Branch|Email|Mobile|Phone)', flat_text, re.IGNORECASE)
     if addr_m: meta["address"] = addr_m.group(1).strip()
-    
+
     cust_m = re.search(r'(?:Customer\s*ID|Cust\s*ID|CIF\s*No|CIF\s*ID)\s*[:\-]?\s*([A-Za-z0-9]+)', flat_text, re.IGNORECASE)
     if cust_m: meta["cust_id"] = cust_m.group(1).strip()
-    
+
     ifsc_m = re.search(r'(?:IFSC\s*Code|RTGS\/NEFT\s*IFSC|IFSC)\s*[:\-]?\s*([A-Z]{4}0[A-Z0-9]{6})', flat_text, re.IGNORECASE)
     if ifsc_m: meta["ifsc"] = ifsc_m.group(1).strip()
-    
+
     acct_m = re.search(r'(?:Account\s*number|Account\s*No|A\/c\s*No|Ac\s*No)\s*[:\-]?\s*(\d{9,18})', flat_text, re.IGNORECASE)
     if acct_m: meta["acct_num"] = acct_m.group(1).strip()
-    
+
     branch_m = re.search(r'(?:Branch\s*Name|Home\s*Branch|Branch)\s*[:\-]\s*([A-Za-z0-9\s,\-]+?)(?:\s{2,}|IFSC|Account|Customer|Date|Period)', flat_text, re.IGNORECASE)
     if branch_m: meta["branch"] = branch_m.group(1).strip()
-    
+
     from_m = re.search(r'(?:from|Period)\s*[:\-]?\s*(\d{1,2}[-/\s][A-Za-z0-9]{2,3}[-/\s]\d{2,4})\s+to\s*[:\-]?\s*(\d{1,2}[-/\s][A-Za-z0-9]{2,3}[-/\s]\d{2,4})', flat_text, re.IGNORECASE)
-    if from_m: 
+    if from_m:
         meta["date_from"] = from_m.group(1).strip()
         meta["date_to"] = from_m.group(2).strip()
-        
+
     return meta
+
 
 # --- UNIVERSAL MULTI-BANK CONVERSION ENGINE ---
 def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
@@ -103,7 +129,14 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
     full_text = ""
     ocr_pages = 0
     pdf_bytes = pdf_file.getvalue()
-    
+
+    # If an image (PNG/JPG) was uploaded, convert it to a 1-page PDF first
+    ext = pdf_file.name.lower().rsplit(".", 1)[-1]
+    if ext in ("png", "jpg", "jpeg"):
+        img_doc = fitz.open(stream=pdf_bytes, filetype=ext)
+        pdf_bytes = img_doc.convert_to_pdf()
+        img_doc.close()
+
     # 1. Open PDF
     try:
         pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=pdf_password if pdf_password else None)
@@ -118,40 +151,43 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
 
     mu_doc = None  # PyMuPDF document, opened only if OCR is needed
 
-    # 2. Extract Text (normal first, OCR fallback per page)
-    total_pages = len(pdf.pages)
-    for idx, page in enumerate(pdf.pages):
-        text = page.extract_text()
-        has_text = bool(text and len(text.strip()) > 30)
+    try:
+        # 2. Extract Text (normal first, OCR fallback per page)
+        total_pages = len(pdf.pages)
+        for idx, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            # A page counts as "real text" only if it has transaction-like amounts
+            amount_count = len(re.findall(r'\d[\d,]*\.\d{2}', text))
+            has_text = amount_count >= 3
 
-        if force_ocr or not has_text:
-            if not tesseract_available():
-                raise ValueError(
-                    "This PDF needs OCR but Tesseract is not installed. "
-                    "Install Tesseract (or add packages.txt on Streamlit Cloud)."
-                )
-            if mu_doc is None:
-                mu_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                if mu_doc.needs_pass:
-                    mu_doc.authenticate(pdf_password or "")
-            status_text.text(f"OCR running: Page {idx + 1} of {total_pages} (scanned page)...")
-            img = render_page_image(mu_doc, idx, ocr_dpi)
-            text = ocr_page_text(img, ocr_lang)
-            ocr_pages += 1
+            if force_ocr or not has_text:
+                if not tesseract_available():
+                    raise ValueError(
+                        "This PDF needs OCR but Tesseract is not installed. "
+                        "Install Tesseract (or add packages.txt on Streamlit Cloud)."
+                    )
+                if mu_doc is None:
+                    mu_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                    if mu_doc.needs_pass:
+                        mu_doc.authenticate(pdf_password or "")
+                status_text.text(f"OCR running: Page {idx + 1} of {total_pages} (scanned page)...")
+                img = render_page_image(mu_doc, idx, ocr_dpi)
+                text = ocr_page_text(img, ocr_lang)
+                ocr_pages += 1
 
-        if text:
-            full_text += text + "\n"
-            
-        elapsed = time.time() - start_time
-        pct = int(((idx + 1) / total_pages) * 75)
-        
-        progress_bar.progress(pct)
-        status_text.text(f"Scanning PDF: Page {idx + 1} of {total_pages} ({pct}%)")
-        timer_text.text(f"Time Taken: {format_seconds(elapsed)}")
-    
-    pdf.close()
-    if mu_doc is not None:
-        mu_doc.close()
+            if text:
+                full_text += text + "\n"
+
+            elapsed = time.time() - start_time
+            pct = int(((idx + 1) / total_pages) * 75)
+
+            progress_bar.progress(pct)
+            status_text.text(f"Scanning PDF: Page {idx + 1} of {total_pages} ({pct}%)")
+            timer_text.text(f"Time Taken: {format_seconds(elapsed)}")
+    finally:
+        pdf.close()
+        if mu_doc is not None:
+            mu_doc.close()
 
     # 3. Parse Transactions
     status_text.text("Validating transactions & calculating balances (82%)...")
@@ -165,7 +201,7 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
 
     date_rgx = r'(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}[-\s][A-Za-z]{3}[-\s]\d{2,4})'
     line_start_pattern = re.compile(rf'^(?:\d+\s+)?({date_rgx})(?:\s+{date_rgx})?\s+(.+)$')
-    
+
     amt_rgx = r'(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2})\s*(?:Cr|Dr|CR|DR|cr|dr)?'
     three_amts_pattern = re.compile(rf'^(.*?)\s+{amt_rgx}\s+{amt_rgx}\s+{amt_rgx}$')
     two_amts_pattern = re.compile(rf'^(.*?)\s+{amt_rgx}\s+{amt_rgx}$')
@@ -173,11 +209,11 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
     standalone_bal_pattern = re.compile(rf'^{amt_rgx}$')
     wrapped_two_amts_pattern = re.compile(rf'^(.*?)\s*{amt_rgx}\s+{amt_rgx}$')
 
+    # Narrower list so real remark lines (ATM, cheque, etc.) are not deleted
     ignore_words = [
-        "discrepancy", "passwords", "atm", "page ", "statement of", "opening balance",
-        "closing balance", "total", "generated on", "computer generated", "branch",
-        "date remarks", "date narration", "date particulars", "withdrawal", "deposit",
-        "chq/ref", "cheque", "brought forward", "carried forward"
+        "discrepancy", "passwords", "generated on", "computer generated",
+        "statement of", "page ", "date remarks", "date narration",
+        "date particulars", "brought forward", "carried forward"
     ]
 
     for line in lines:
@@ -198,14 +234,14 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
             m1 = one_amt_pattern.match(rest)
 
             if m3:
-                current_txn = {'Date': txn_date, 'Remarks': m3.group(1).strip(), 
-                               'Amount': float(m3.group(2).replace(',', '')) if float(m3.group(2).replace(',', '')) > 0 else float(m3.group(3).replace(',', '')), 
+                current_txn = {'Date': txn_date, 'Remarks': m3.group(1).strip(),
+                               'Amount': float(m3.group(2).replace(',', '')) if float(m3.group(2).replace(',', '')) > 0 else float(m3.group(3).replace(',', '')),
                                'Balance': float(m3.group(4).replace(',', ''))}
             elif m2:
-                current_txn = {'Date': txn_date, 'Remarks': m2.group(1).strip(), 
+                current_txn = {'Date': txn_date, 'Remarks': m2.group(1).strip(),
                                'Amount': float(m2.group(2).replace(',', '')), 'Balance': float(m2.group(3).replace(',', ''))}
             elif m1:
-                current_txn = {'Date': txn_date, 'Remarks': m1.group(1).strip(), 
+                current_txn = {'Date': txn_date, 'Remarks': m1.group(1).strip(),
                                'Amount': float(m1.group(2).replace(',', '')), 'Balance': None}
             else:
                 current_txn = {'Date': txn_date, 'Remarks': rest, 'Amount': None, 'Balance': None}
@@ -216,7 +252,7 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
             if bal_match and current_txn['Amount'] is not None:
                 current_txn['Balance'] = float(bal_match.group(1).replace(',', ''))
                 continue
-                
+
             wrap_m2 = wrapped_two_amts_pattern.match(line)
             if wrap_m2 and current_txn['Amount'] is None:
                 extra_rem = wrap_m2.group(1).strip()
@@ -280,7 +316,7 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
     # 6. Build Excel File to Memory Buffer
     status_text.text("Applying professional formatting (92%)...")
     progress_bar.progress(92)
-    
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Statement', index=False, startrow=13)
@@ -300,7 +336,7 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
         worksheet['C5'] = "IFSC:"; worksheet.merge_cells('D5:E5'); worksheet['D5'] = meta["ifsc"]
         worksheet['A6'] = "Account number:"; worksheet['B6'] = meta["acct_num"]
         worksheet['C6'] = "Branch Name:"; worksheet.merge_cells('D6:E6'); worksheet['D6'] = meta["branch"]
-        
+
         box_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
         for r in range(4, 7):
             for c in range(1, 6):
@@ -328,14 +364,22 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
                 cell.border = box_border
                 cell.alignment = Alignment(wrap_text=True, vertical='center')
 
+        # Keep the Balance exactly as read from the PDF; column F flags rows where the math fails
+        worksheet["F14"] = "CHECK"
+        worksheet["F14"].font = Font(bold=True)
+        worksheet["F14"].border = box_border
+        worksheet["F14"].alignment = Alignment(horizontal='center', vertical='center')
         for r in range(16, max_row + 1):
-            worksheet[f"E{r}"] = f"=E{r-1}+SUM(D{r})-SUM(C{r})"
+            worksheet[f"F{r}"] = f'=IF(ROUND(E{r-1}+D{r}-C{r}-E{r},2)=0,"OK","CHECK")'
+            worksheet[f"F{r}"].border = box_border
+            worksheet[f"F{r}"].alignment = Alignment(horizontal='center', vertical='center')
 
         worksheet.column_dimensions['A'].width = 18
         worksheet.column_dimensions['B'].width = 45
         worksheet.column_dimensions['C'].width = 15
         worksheet.column_dimensions['D'].width = 15
         worksheet.column_dimensions['E'].width = 18
+        worksheet.column_dimensions['F'].width = 12
         worksheet.row_dimensions[4].height = 30
 
     progress_bar.progress(100)
@@ -343,18 +387,20 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
     output.seek(0)
     return output, len(df), ocr_pages, total_pages, mismatch_rows
 
+
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Universal Bank Converter", page_icon="🏦")
 st.title("🏦 Universal Bank Statement Converter")
 st.write("Convert your PDF bank statements (including scanned / unselectable PDFs) directly to a formatted Excel file.")
 
-uploaded_file = st.file_uploader("Upload Bank Statement PDF", type=["pdf"])
+uploaded_file = st.file_uploader("Upload Bank Statement (PDF or image)", type=["pdf", "png", "jpg", "jpeg"])
 pdf_password = st.text_input("PDF Password (leave blank if none)", type="password")
 
 with st.expander("⚙️ OCR settings (for scanned PDFs)"):
     force_ocr = st.checkbox("Force OCR on all pages", value=False,
                             help="Normally OCR runs only on pages that have no selectable text.")
-    ocr_lang = st.text_input("OCR language", value="eng", help="Example: eng+hin for English + Hindi")
+    ocr_lang = st.text_input("OCR language", value="eng",
+                             help="Example: eng+hin for English + Hindi, eng+guj for English + Gujarati")
     ocr_dpi = st.select_slider("OCR quality (DPI)", options=[200, 250, 300, 400], value=300,
                                help="Higher = more accurate but slower.")
 
@@ -363,13 +409,13 @@ if uploaded_file is not None:
         progress_bar = st.progress(0)
         status_text = st.empty()
         timer_text = st.empty()
-        
+
         try:
             excel_buffer, n_txn, ocr_pages, total_pages, mismatch = process_pdf(
                 uploaded_file, pdf_password, progress_bar, status_text, timer_text,
                 force_ocr=force_ocr, ocr_lang=ocr_lang, ocr_dpi=ocr_dpi
             )
-            
+
             st.success("Conversion successful!")
             if ocr_pages:
                 st.info(f"OCR was used on {ocr_pages} of {total_pages} pages.")
@@ -379,7 +425,7 @@ if uploaded_file is not None:
             st.download_button(
                 label="📥 Download Excel File",
                 data=excel_buffer,
-                file_name=f"{uploaded_file.name.replace('.pdf', '')}_Converted.xlsx",
+                file_name=f"{uploaded_file.name.rsplit('.', 1)[0]}_Converted.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         except Exception as e:
