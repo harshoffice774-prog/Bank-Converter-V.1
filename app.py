@@ -9,7 +9,10 @@ import pytesseract
 from PIL import Image, ImageOps
 from pdfminer.pdfdocument import PDFPasswordIncorrect
 from datetime import datetime
-from openpyxl.styles import Border, Side, Alignment, Font
+from openpyxl import Workbook
+from openpyxl.styles import Border, Side, Alignment, Font, PatternFill
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
+from openpyxl.worksheet.properties import PageSetupProperties
 
 # Windows only: if Tesseract is not in PATH, uncomment and fix this path
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -90,11 +93,49 @@ def ocr_page_text(img, lang):
 
 
 # --- UNIVERSAL METADATA EXTRACTOR ---
+KNOWN_BANKS = [
+    ("State Bank of India", r"State\s+Bank\s+of\s+India|\bSBI\b"),
+    ("HDFC Bank", r"HDFC\s+Bank"),
+    ("ICICI Bank", r"ICICI\s+Bank"),
+    ("Axis Bank", r"Axis\s+Bank"),
+    ("Kotak Mahindra Bank", r"Kotak\s+Mahindra"),
+    ("Punjab National Bank", r"Punjab\s+National\s+Bank|\bPNB\b"),
+    ("Bank of Baroda", r"Bank\s+of\s+Baroda"),
+    ("Canara Bank", r"Canara\s+Bank"),
+    ("Union Bank of India", r"Union\s+Bank\s+of\s+India"),
+    ("Central Bank of India", r"Central\s+Bank\s+of\s+India"),
+    ("Bank of Maharashtra", r"Bank\s+of\s+Maharashtra"),
+    ("Bank of India", r"Bank\s+of\s+India"),
+    ("IDBI Bank", r"IDBI\s+Bank"),
+    ("Yes Bank", r"Yes\s+Bank"),
+    ("IndusInd Bank", r"IndusInd\s+Bank"),
+    ("Federal Bank", r"Federal\s+Bank"),
+    ("IDFC FIRST Bank", r"IDFC\s+FIRST\s+Bank"),
+    ("Indian Overseas Bank", r"Indian\s+Overseas\s+Bank"),
+    ("Indian Bank", r"Indian\s+Bank"),
+    ("UCO Bank", r"UCO\s+Bank"),
+    ("Bandhan Bank", r"Bandhan\s+Bank"),
+    ("Punjab & Sind Bank", r"Punjab\s*(?:&|and)\s*Sind\s+Bank"),
+]
+
+IFSC_BANK_PREFIX = {
+    "SBIN": "State Bank of India", "HDFC": "HDFC Bank", "ICIC": "ICICI Bank",
+    "UTIB": "Axis Bank", "KKBK": "Kotak Mahindra Bank", "PUNB": "Punjab National Bank",
+    "BARB": "Bank of Baroda", "CNRB": "Canara Bank", "UBIN": "Union Bank of India",
+    "BKID": "Bank of India", "IBKL": "IDBI Bank", "YESB": "Yes Bank",
+    "INDB": "IndusInd Bank", "FDRL": "Federal Bank", "IDFB": "IDFC FIRST Bank",
+    "IDIB": "Indian Bank", "CBIN": "Central Bank of India", "UCBA": "UCO Bank",
+    "BDBL": "Bandhan Bank", "MAHB": "Bank of Maharashtra", "IOBA": "Indian Overseas Bank",
+    "PSIB": "Punjab & Sind Bank",
+}
+
+
 def extract_metadata(text):
     flat_text = text.replace('\n', '  ')
     meta = {
-        "name": "-", "address": "-", "cust_id": "-", "ifsc": "-",
-        "acct_num": "-", "branch": "-", "date_from": "-", "date_to": "-"
+        "bank": "-", "name": "-", "address": "-", "cust_id": "-", "ifsc": "-",
+        "acct_num": "-", "acct_type": "-", "branch": "-", "email": "-",
+        "date_from": "-", "date_to": "-"
     }
 
     name_m = re.search(r'(?:Account\s*holder\s*name|Customer\s*Name|Account\s*Name|Name)\s*[:\-]\s*(.*?)\s+(?:Account|Customer|Address|Branch|IFSC|CIF)', flat_text, re.IGNORECASE)
@@ -107,7 +148,7 @@ def extract_metadata(text):
     if cust_m: meta["cust_id"] = cust_m.group(1).strip()
 
     ifsc_m = re.search(r'(?:IFSC\s*Code|RTGS\/NEFT\s*IFSC|IFSC)\s*[:\-]?\s*([A-Z]{4}0[A-Z0-9]{6})', flat_text, re.IGNORECASE)
-    if ifsc_m: meta["ifsc"] = ifsc_m.group(1).strip()
+    if ifsc_m: meta["ifsc"] = ifsc_m.group(1).strip().upper()
 
     acct_m = re.search(r'(?:Account\s*number|Account\s*No|A\/c\s*No|Ac\s*No)\s*[:\-]?\s*(\d{9,18})', flat_text, re.IGNORECASE)
     if acct_m: meta["acct_num"] = acct_m.group(1).strip()
@@ -120,7 +161,235 @@ def extract_metadata(text):
         meta["date_from"] = from_m.group(1).strip()
         meta["date_to"] = from_m.group(2).strip()
 
+    # Account type: "Account Type: Savings" or "Savings Account"
+    type_m = re.search(r'(?:Account\s*Type|A\/c\s*Type|Type\s*of\s*Account|Scheme\s*Name)\s*[:\-]\s*([A-Za-z ]{3,40}?)(?=\s{2,}|\s+(?:Account|Customer|IFSC|Branch|Date|Currency|MICR|Name|Address)\b|$)', flat_text, re.IGNORECASE)
+    if type_m:
+        meta["acct_type"] = type_m.group(1).strip()
+    else:
+        kw_m = re.search(r'\b(Savings|Current|Salary|Cash\s*Credit|Overdraft)\s+(?:Bank\s+)?(?:Account|A\/c)\b', flat_text, re.IGNORECASE)
+        if kw_m: meta["acct_type"] = kw_m.group(1).strip().title() + " Account"
+
+    email_m = re.search(r'[\w.\-+]+@[\w\-]+\.[\w.\-]+', flat_text)
+    if email_m: meta["email"] = email_m.group(0)
+
+    # Bank name: known names in the top of the statement, then IFSC prefix as backup
+    head = flat_text[:3000]
+    for display, pattern in KNOWN_BANKS:
+        if re.search(pattern, head, re.IGNORECASE):
+            meta["bank"] = display
+            break
+    if meta["bank"] == "-" and meta["ifsc"] != "-":
+        meta["bank"] = IFSC_BANK_PREFIX.get(meta["ifsc"][:4], "-")
+
     return meta
+
+
+# --- PROFESSIONAL EXCEL BUILDER ---
+NAVY, BLUE, LIGHT, GREY = "1F3864", "2F5597", "D9E1F2", "F2F2F2"
+_THIN = Side(style="thin", color="BFBFBF")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_NUM = '#,##0.00'
+
+
+def _style(cell, bold=False, size=10, color="000000", fill=None, h=None, v="center",
+           wrap=False, fmt=None, border=True, italic=False):
+    cell.font = Font(name="Calibri", size=size, bold=bold, color=color, italic=italic)
+    if fill:
+        cell.fill = PatternFill("solid", start_color=fill, end_color=fill)
+    cell.alignment = Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+    if fmt:
+        cell.number_format = fmt
+    if border:
+        cell.border = _BORDER
+
+
+def _merge(ws, rng, value=None, **kw):
+    ws.merge_cells(rng)
+    rows = ws[rng]
+    rows[0][0].value = value
+    for row in rows:
+        for c in row:
+            _style(c, **kw)
+
+
+def build_excel(df, meta, opening_value, opening_derived, ocr_used):
+    n = len(df)
+    period_from = meta["date_from"] if meta["date_from"] != "-" else str(df["Date"].iloc[0])
+    period_to = meta["date_to"] if meta["date_to"] != "-" else str(df["Date"].iloc[-1])
+    period = f"{period_from}  to  {period_to}"
+
+    wb = Workbook()
+    ws_sum = wb.active
+    ws_sum.title = "Summary"
+    ws = wb.create_sheet("Transactions")
+    ws_sum.sheet_view.showGridLines = False
+    ws.sheet_view.showGridLines = False
+
+    HEADER_ROW, OPEN_ROW, FIRST = 4, 5, 6
+    LAST = OPEN_ROW + n
+    TOTAL = LAST + 1
+
+    # ---------------- Transactions sheet ----------------
+    _merge(ws, "A1:G1", f"Transaction Details  -  {meta['bank'] if meta['bank'] != '-' else 'Bank Statement'}",
+           bold=True, size=16, color="FFFFFF", fill=NAVY, h="center", border=False)
+    ws.row_dimensions[1].height = 30
+    _merge(ws, "A2:G2",
+           f"Account Holder: {meta['name']}   |   Account No: {meta['acct_num']}   |   Period: {period}",
+           size=10, color="FFFFFF", fill=BLUE, h="center", border=False)
+    ws.row_dimensions[2].height = 20
+
+    headers = ["Date", "Remarks / Narration", "Debit (Dr)", "Credit (Cr)",
+               "Balance (Calculated)", "Balance (Per Statement)", "Check"]
+    for col, text in enumerate(headers, 1):
+        c = ws.cell(row=HEADER_ROW, column=col, value=text)
+        _style(c, bold=True, color="FFFFFF", fill=NAVY, h="center", wrap=True)
+    ws.row_dimensions[HEADER_ROW].height = 32
+
+    # Opening balance row
+    for col in range(1, 8):
+        _style(ws.cell(row=OPEN_ROW, column=col), bold=True, fill=LIGHT)
+    ws.cell(row=OPEN_ROW, column=2, value="Opening Balance")
+    ws.cell(row=OPEN_ROW, column=5, value=opening_value)
+    ws.cell(row=OPEN_ROW, column=6, value=f"=E{OPEN_ROW}")
+    for col in (5, 6):
+        ws.cell(row=OPEN_ROW, column=col).number_format = _NUM
+        ws.cell(row=OPEN_ROW, column=col).alignment = Alignment(horizontal="right", vertical="center")
+
+    # Transaction rows
+    for i in range(n):
+        r = FIRST + i
+        row = df.iloc[i]
+        band = GREY if i % 2 == 1 else None
+
+        date_val = row["Date"]
+        dt = parse_any_date(str(date_val))
+        c = ws.cell(row=r, column=1, value=dt if dt else date_val)
+        _style(c, fill=band, h="center", fmt="dd-mmm-yyyy" if dt else None)
+
+        c = ws.cell(row=r, column=2, value=row["Remarks"])
+        _style(c, fill=band, wrap=True, v="top")
+
+        debit = row["Debit"] if pd.notna(row["Debit"]) else None
+        credit = row["Credit"] if pd.notna(row["Credit"]) else None
+        c = ws.cell(row=r, column=3, value=debit)
+        _style(c, fill=band, h="right", fmt=_NUM, color="C00000")
+        c = ws.cell(row=r, column=4, value=credit)
+        _style(c, fill=band, h="right", fmt=_NUM, color="00703C")
+
+        # Opening + Credit - Debit = Closing, row by row
+        c = ws.cell(row=r, column=5, value=f"=ROUND(E{r-1}+D{r}-C{r},2)")
+        _style(c, fill=band, h="right", fmt=_NUM, bold=True)
+        c = ws.cell(row=r, column=6, value=float(row["Balance"]))
+        _style(c, fill=band, h="right", fmt=_NUM)
+        c = ws.cell(row=r, column=7, value=f'=IF(ROUND(F{r-1}+D{r}-C{r}-F{r},2)=0,"OK","CHECK")')
+        _style(c, fill=band, h="center", bold=True)
+
+    # Totals row
+    for col in range(1, 8):
+        _style(ws.cell(row=TOTAL, column=col), bold=True, fill=LIGHT)
+    ws.cell(row=TOTAL, column=2, value="TOTAL")
+    ws.cell(row=TOTAL, column=3, value=f"=SUM(C{FIRST}:C{LAST})")
+    ws.cell(row=TOTAL, column=4, value=f"=SUM(D{FIRST}:D{LAST})")
+    ws.cell(row=TOTAL, column=5, value=f"=E{LAST}")
+    ws.cell(row=TOTAL, column=6, value=f"=F{LAST}")
+    for col in (3, 4, 5, 6):
+        cell = ws.cell(row=TOTAL, column=col)
+        cell.number_format = _NUM
+        cell.alignment = Alignment(horizontal="right", vertical="center")
+
+    # Highlight OK / CHECK
+    g_range = f"G{FIRST}:G{LAST}"
+    ws.conditional_formatting.add(g_range, CellIsRule(
+        operator="equal", formula=['"OK"'],
+        font=Font(color="006100", bold=True), fill=PatternFill("solid", start_color="C6EFCE", end_color="C6EFCE")))
+    ws.conditional_formatting.add(g_range, CellIsRule(
+        operator="equal", formula=['"CHECK"'],
+        font=Font(color="9C0006", bold=True), fill=PatternFill("solid", start_color="FFC7CE", end_color="FFC7CE")))
+
+    for col, width in zip("ABCDEFG", (14, 52, 16, 16, 20, 22, 10)):
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = f"A{OPEN_ROW}"
+    ws.auto_filter.ref = f"A{HEADER_ROW}:G{LAST}"
+    ws.print_title_rows = f"{HEADER_ROW}:{HEADER_ROW}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+
+    # ---------------- Summary sheet ----------------
+    for col, width in zip("ABCD", (26, 44, 28, 26)):
+        ws_sum.column_dimensions[col].width = width
+
+    _merge(ws_sum, "A1:D1", "BANK ACCOUNT STATEMENT", bold=True, size=20, color="FFFFFF",
+           fill=NAVY, h="center", border=False)
+    ws_sum.row_dimensions[1].height = 38
+    _merge(ws_sum, "A2:D2", meta["bank"] if meta["bank"] != "-" else "Bank name not detected",
+           bold=True, size=13, color="FFFFFF", fill=BLUE, h="center", border=False)
+    ws_sum.row_dimensions[2].height = 24
+
+    _merge(ws_sum, "A4:D4", "ACCOUNT HOLDER DETAILS", bold=True, size=11, color=NAVY, fill=LIGHT, border=True)
+
+    def pair(row, l_label, l_value, r_label, r_value):
+        c = ws_sum.cell(row=row, column=1, value=l_label); _style(c, bold=True, fill=GREY)
+        c = ws_sum.cell(row=row, column=2, value=l_value); _style(c, wrap=True)
+        c = ws_sum.cell(row=row, column=3, value=r_label); _style(c, bold=True, fill=GREY)
+        c = ws_sum.cell(row=row, column=4, value=r_value); _style(c, wrap=True)
+
+    pair(5, "Account Holder Name", meta["name"], "Account Number", meta["acct_num"])
+    pair(6, "Address", meta["address"], "Account Type", meta["acct_type"])
+    pair(7, "Customer ID", meta["cust_id"], "IFSC Code", meta["ifsc"])
+    pair(8, "Bank Name", meta["bank"], "Branch", meta["branch"])
+    pair(9, "Email", meta["email"], "Report Generated On", datetime.today().strftime("%d-%b-%Y"))
+    ws_sum.row_dimensions[6].height = 48
+    c = ws_sum.cell(row=10, column=1, value="Statement Period"); _style(c, bold=True, fill=GREY)
+    _merge(ws_sum, "B10:D10", period, bold=True)
+
+    _merge(ws_sum, "A12:D12", "ACCOUNT SUMMARY", bold=True, size=11, color=NAVY, fill=LIGHT, border=True)
+
+    def money_pair(row, l_label, l_formula, r_label, r_formula, fmt=_NUM):
+        c = ws_sum.cell(row=row, column=1, value=l_label); _style(c, bold=True, fill=GREY)
+        c = ws_sum.cell(row=row, column=2, value=l_formula); _style(c, h="right", bold=True, fmt=fmt)
+        c = ws_sum.cell(row=row, column=3, value=r_label); _style(c, bold=True, fill=GREY)
+        c = ws_sum.cell(row=row, column=4, value=r_formula); _style(c, h="right", bold=True, fmt=fmt)
+
+    money_pair(13, "Opening Balance", f"=Transactions!E{OPEN_ROW}",
+               "Total Credits (+)", f"=Transactions!D{TOTAL}")
+    money_pair(14, "No. of Transactions", f"=COUNT(Transactions!F{FIRST}:F{LAST})",
+               "Total Debits (-)", f"=Transactions!C{TOTAL}")
+    ws_sum["B14"].number_format = "0"
+    money_pair(15, "Closing Balance (Calculated)", "=B13+D13-D14",
+               "Closing Balance (Per Statement)", f"=Transactions!F{LAST}")
+
+    check_cnt = f'COUNTIF(Transactions!G{FIRST}:G{LAST},"CHECK")'
+    c = ws_sum.cell(row=16, column=1, value="Reconciliation"); _style(c, bold=True, fill=GREY)
+    _merge(ws_sum, "B16:D16",
+           f'=IF(AND({check_cnt}=0,ROUND(B15-D15,2)=0),"All balances verified",'
+           f'{check_cnt}&" row(s) need review - compare with the original PDF")',
+           bold=True, h="center")
+    ws_sum.conditional_formatting.add("B16:D16", FormulaRule(
+        formula=['$B$16="All balances verified"'],
+        font=Font(color="006100", bold=True), fill=PatternFill("solid", start_color="C6EFCE", end_color="C6EFCE")))
+    ws_sum.conditional_formatting.add("B16:D16", FormulaRule(
+        formula=['$B$16<>"All balances verified"'],
+        font=Font(color="9C0006", bold=True), fill=PatternFill("solid", start_color="FFC7CE", end_color="FFC7CE")))
+
+    notes = ["Closing Balance = Opening Balance + Total Credits - Total Debits."]
+    if opening_derived:
+        notes.append("Opening balance was not printed in the statement, so it was worked out from the first transaction.")
+    if ocr_used:
+        notes.append("Some pages were read with OCR. Please check rows marked CHECK against the original PDF.")
+    for i, note in enumerate(notes):
+        _merge(ws_sum, f"A{18 + i}:D{18 + i}", note, italic=True, size=9, color="595959", border=False)
+
+    ws_sum.page_setup.orientation = "portrait"
+    ws_sum.page_setup.fitToWidth = 1
+    ws_sum.page_setup.fitToHeight = 0
+    ws_sum.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
 
 
 # --- UNIVERSAL MULTI-BANK CONVERSION ENGINE ---
@@ -322,74 +591,22 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
     df['Debit'] = debits; df['Credit'] = credits
     df = df[['Date', 'Remarks', 'Debit', 'Credit', 'Balance']]
 
-    # 6. Build Excel File to Memory Buffer
+    # 6. Build the formatted Excel file
     status_text.text("Applying professional formatting (92%)...")
     progress_bar.progress(92)
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='Statement', index=False, startrow=13)
-        worksheet = writer.sheets['Statement']
+    def _num(v):
+        return float(v) if pd.notna(v) else 0.0
 
-        worksheet.merge_cells('A1:E2')
-        worksheet['A1'] = "Detailed Statement"
-        worksheet['A1'].font = Font(size=18, bold=True)
-        worksheet['A1'].alignment = Alignment(horizontal='center', vertical='center')
-        worksheet['E3'] = f"Date: {datetime.today().strftime('%d/%m/%Y')}"
-        worksheet['E3'].font = Font(bold=True)
-        worksheet['E3'].alignment = Alignment(horizontal='right')
+    opening_derived = opening_bal is None
+    if opening_derived:
+        # Work backwards from the first row: opening = balance + debit - credit
+        r0 = df.iloc[0]
+        opening_value = round(_num(r0['Balance']) + _num(r0['Debit']) - _num(r0['Credit']), 2)
+    else:
+        opening_value = opening_bal
 
-        worksheet['A4'] = "Account holder name:"; worksheet['B4'] = meta["name"]
-        worksheet['C4'] = "Account holder address:"; worksheet.merge_cells('D4:E4'); worksheet['D4'] = meta["address"]
-        worksheet['A5'] = "Customer ID:"; worksheet['B5'] = meta["cust_id"]
-        worksheet['C5'] = "IFSC:"; worksheet.merge_cells('D5:E5'); worksheet['D5'] = meta["ifsc"]
-        worksheet['A6'] = "Account number:"; worksheet['B6'] = meta["acct_num"]
-        worksheet['C6'] = "Branch Name:"; worksheet.merge_cells('D6:E6'); worksheet['D6'] = meta["branch"]
-
-        box_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-        for r in range(4, 7):
-            for c in range(1, 6):
-                cell = worksheet.cell(row=r, column=c)
-                cell.border = box_border
-                cell.alignment = Alignment(vertical='center', wrap_text=True)
-                if c in [1, 3]: cell.font = Font(size=10)
-                else: cell.font = Font(size=10, bold=True)
-
-        worksheet['A8'] = "Transaction Date"; worksheet['B8'] = f"from: {meta['date_from']}"; worksheet['C8'] = f"to: {meta['date_to']}"
-        worksheet['A9'] = "Amount"; worksheet['B9'] = "from: -"; worksheet['C9'] = "to: -"
-        worksheet['A10'] = "Cheque"; worksheet['B10'] = "from: -"; worksheet['C10'] = "to: -"
-        worksheet['A11'] = "Transaction type: All"
-        for r in range(8, 12):
-            for c in range(1, 4): worksheet.cell(row=r, column=c).font = Font(bold=True, size=10)
-
-        headers = ["DATE", "REMARKS", "DEBIT", "CREDIT", "BALANCE"]
-        for col_num, header in enumerate(headers, 1):
-            cell = worksheet.cell(row=14, column=col_num, value=header)
-            cell.font = Font(bold=True); cell.border = box_border; cell.alignment = Alignment(horizontal='center', vertical='center')
-
-        max_row = worksheet.max_row
-        for row in worksheet.iter_rows(min_row=15, max_row=max_row, min_col=1, max_col=5):
-            for cell in row:
-                cell.border = box_border
-                cell.alignment = Alignment(wrap_text=True, vertical='center')
-
-        # Keep the Balance exactly as read from the PDF; column F flags rows where the math fails
-        worksheet["F14"] = "CHECK"
-        worksheet["F14"].font = Font(bold=True)
-        worksheet["F14"].border = box_border
-        worksheet["F14"].alignment = Alignment(horizontal='center', vertical='center')
-        for r in range(16, max_row + 1):
-            worksheet[f"F{r}"] = f'=IF(ROUND(E{r-1}+D{r}-C{r}-E{r},2)=0,"OK","CHECK")'
-            worksheet[f"F{r}"].border = box_border
-            worksheet[f"F{r}"].alignment = Alignment(horizontal='center', vertical='center')
-
-        worksheet.column_dimensions['A'].width = 18
-        worksheet.column_dimensions['B'].width = 45
-        worksheet.column_dimensions['C'].width = 15
-        worksheet.column_dimensions['D'].width = 15
-        worksheet.column_dimensions['E'].width = 18
-        worksheet.column_dimensions['F'].width = 12
-        worksheet.row_dimensions[4].height = 30
+    output = build_excel(df, meta, opening_value, opening_derived, ocr_pages > 0)
 
     progress_bar.progress(100)
     status_text.text(f"✅ Complete! Extracted {len(df)} transactions.")
