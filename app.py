@@ -52,7 +52,7 @@ def render_page_image(doc, page_idx, dpi):
     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     img = ImageOps.grayscale(img)
     img = ImageOps.autocontrast(img, cutoff=2)
-    img = img.point(lambda p: 255 if p > 170 else 0)
+    # img = img.point(lambda p: 255 if p > 170 else 0)
     img = ImageOps.expand(img, border=20, fill=255)
     return img
 
@@ -188,7 +188,9 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
         pdf.close()
         if mu_doc is not None:
             mu_doc.close()
+
     st.session_state["ocr_debug"] = full_text
+
     # 3. Parse Transactions
     status_text.text("Validating transactions & calculating balances (82%)...")
     progress_bar.progress(82)
@@ -216,7 +218,7 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
         "date particulars", "brought forward", "carried forward"
     ]
 
-       for line in lines:
+    for line in lines:
         line = line.strip()
         line = re.sub(r'^[^\w₹]+', '', line)
         if not line or line.startswith('---'):
@@ -431,6 +433,7 @@ if uploaded_file is not None:
             )
         except Exception as e:
             st.error(f"Error: {e}")
+
 if st.session_state.get("ocr_debug"):
     with st.expander("🔍 Show OCR text (debug)"):
         st.text_area("What Tesseract read from your PDF",
