@@ -59,7 +59,8 @@ def render_page_image(doc, page_idx, dpi):
 
 def clean_ocr_text(text):
     """Fix common OCR glitches so the amount/date patterns still match."""
-    text = text.replace('|', ' ')
+    text = text.replace('|', ' ').replace('_', ' ')
+    text = re.sub(r'\s[=~]\s', ' ', text)                  # stray '=' between columns
     text = re.sub(r'(\d)\s+\.(\d{2})\b', r'\1.\2', text)    # "1,234 .56" -> "1,234.56"
     text = re.sub(r'(\d),\s(\d{3})', r'\1,\2', text)         # "1, 234.00" -> "1,234.00"
     text = re.sub(r'[ \t]+', ' ', text)
@@ -201,7 +202,7 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
     transactions = []
     current_txn = None
 
-    date_rgx = r'(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}[-\s][A-Za-z]{3}[-\s]\d{2,4})'
+    date_rgx = r'(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}[-\s][A-Za-z]{3}[-\s]\d{2,4}|[A-Za-z]{2,3}/[A-Za-z]{2,3}/[A-Za-z]{3,4})'
     line_start_pattern = re.compile(rf'^(?:\d+\s+)?({date_rgx})(?:\s+{date_rgx})?\s+(.+)$')
 
     amt_rgx = r'(?:₹|Rs\.?|INR)?\s*([\d,]+\.\d{2})\s*(?:Cr|Dr|CR|DR|cr|dr)?'
@@ -215,7 +216,7 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
     ignore_words = [
         "discrepancy", "passwords", "generated on", "computer generated",
         "statement of", "page ", "date remarks", "date narration",
-        "date particulars", "brought forward", "carried forward"
+        "date particulars", "date payment", "paid in", "brought forward", "carried forward"
     ]
 
     for line in lines:
@@ -280,22 +281,27 @@ def process_pdf(pdf_file, pdf_password, progress_bar, status_text, timer_text,
         raise ValueError("Could not detect transactions in this statement.")
 
     # 4. Chronological Check
+    reversed_order = False
     if len(transactions) > 1:
         first_dt = parse_any_date(transactions[0]['Date'])
         last_dt = parse_any_date(transactions[-1]['Date'])
         if first_dt and last_dt and first_dt > last_dt:
             transactions.reverse()
+            reversed_order = True
 
     df = pd.DataFrame(transactions)
 
     # 5. Math Validation
     debits, credits = [], []
     mismatch_rows = 0
+    ob = re.search(r'(?:Brought\s*Forward|Opening\s*Balance)[^\d\n]*([\d,]+\.\d{2})', full_text, re.IGNORECASE)
+    opening_bal = float(ob.group(1).replace(',', '')) if (ob and not reversed_order) else None
     for i in range(len(df)):
         amt = df.loc[i, 'Amount']
         remarks = df.loc[i, 'Remarks'].upper()
-        if i > 0:
-            diff = round(df.loc[i, 'Balance'] - df.loc[i-1, 'Balance'], 2)
+        prev_bal = opening_bal if i == 0 else df.loc[i-1, 'Balance']
+        if prev_bal is not None:
+            diff = round(df.loc[i, 'Balance'] - prev_bal, 2)
             if abs(abs(diff) - amt) > 0.01:
                 mismatch_rows += 1   # possible OCR misread
             if diff > 0:
